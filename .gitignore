@@ -1,3 +1,4 @@
 *.joblib
 artifacts/
+IMDB Dataset.csv
 __pycache__/
