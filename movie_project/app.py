@@ -8,8 +8,10 @@ import random
 import textwrap
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from src.data_cleaning import load_and_clean_data
@@ -54,7 +56,7 @@ def _poster_url(seed: int) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def get_tmdb_data(csv_path: str) -> tuple[pd.DataFrame, bool]:
+def get_tmdb_data(csv_path: str) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
     tmdb = pd.read_csv(csv_path)
     if "poster_path" not in tmdb.columns:
         tmdb["poster_path"] = ""
@@ -62,16 +64,24 @@ def get_tmdb_data(csv_path: str) -> tuple[pd.DataFrame, bool]:
         tmdb["backdrop_path"] = ""
     if "genres" not in tmdb.columns:
         tmdb["genres"] = ""
+    if "keywords" not in tmdb.columns:
+        tmdb["keywords"] = ""
+    if "release_date" not in tmdb.columns:
+        tmdb["release_date"] = ""
 
     tmdb["title"] = tmdb.get("title", pd.Series(dtype=str)).fillna("Untitled")
     tmdb["overview"] = tmdb.get("overview", pd.Series(dtype=str)).fillna("")
     tmdb["poster_path"] = tmdb["poster_path"].astype(str).str.strip()
     tmdb["poster_path"] = tmdb["poster_path"].replace({"nan": "", "None": ""})
     tmdb["primary_genre"] = tmdb["genres"].apply(lambda x: _extract_primary_genre(str(x)))
+    tmdb["vote_average"] = pd.to_numeric(tmdb.get("vote_average", 0), errors="coerce").fillna(0.0)
+    tmdb["popularity"] = pd.to_numeric(tmdb.get("popularity", 0), errors="coerce").fillna(0.0)
+    tmdb["release_year"] = pd.to_datetime(tmdb["release_date"], errors="coerce").dt.year
+    tmdb["release_year"] = tmdb["release_year"].fillna(0).astype(int)
 
     tmdb_with_posters = tmdb[tmdb["poster_path"].ne("")].copy().reset_index(drop=True)
     all_posters_missing = tmdb_with_posters.empty
-    return tmdb_with_posters, all_posters_missing
+    return tmdb.reset_index(drop=True), tmdb_with_posters, all_posters_missing
 
 
 def _extract_primary_genre(raw_genres: str) -> str:
@@ -86,6 +96,23 @@ def _extract_primary_genre(raw_genres: str) -> str:
         if isinstance(first, dict) and first.get("name"):
             return str(first["name"])
     return "Unknown"
+
+
+def _extract_keywords(raw_keywords: str, max_items: int = 5) -> str:
+    if not raw_keywords:
+        return "Not available"
+    try:
+        parsed = ast.literal_eval(raw_keywords)
+    except (ValueError, SyntaxError):
+        return "Not available"
+    names: list[str] = []
+    if isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, dict) and item.get("name"):
+                names.append(str(item["name"]))
+            if len(names) >= max_items:
+                break
+    return ", ".join(names) if names else "Not available"
 
 
 def _tmdb_image_url(poster_path: str, size: str = "w500") -> str:
@@ -123,6 +150,33 @@ def get_movie_data(index: int, tmdb_df: pd.DataFrame) -> tuple[str, str, str, st
     poster_url = _tmdb_image_url(row.get("poster_path", ""), size="w500") or _poster_url(index + 1)
     genre = _extract_primary_genre(str(row.get("genres", "")))
     return title, overview, poster_url, genre
+
+
+def get_movie_payload(index: int, tmdb_df: pd.DataFrame) -> dict[str, str]:
+    if tmdb_df.empty:
+        fallback_id = index + 1
+        return {
+            "title": f"Movie #{fallback_id}",
+            "overview": "No overview available.",
+            "poster_url": _poster_url(fallback_id),
+            "genre": "Unknown",
+            "rating": "N/A",
+            "popularity": "N/A",
+            "keywords": "Not available",
+        }
+
+    row = tmdb_df.iloc[index % len(tmdb_df)]
+    rating_val = pd.to_numeric(row.get("vote_average", np.nan), errors="coerce")
+    popularity_val = pd.to_numeric(row.get("popularity", np.nan), errors="coerce")
+    return {
+        "title": str(row.get("title", "Untitled")).strip() or "Untitled",
+        "overview": str(row.get("overview", "")).strip() or "No overview available.",
+        "poster_url": _tmdb_image_url(row.get("poster_path", ""), size="w500") or _poster_url(index + 1),
+        "genre": _extract_primary_genre(str(row.get("genres", ""))),
+        "rating": f"{rating_val:.1f}" if pd.notna(rating_val) else "N/A",
+        "popularity": f"{popularity_val:.1f}" if pd.notna(popularity_val) else "N/A",
+        "keywords": _extract_keywords(str(row.get("keywords", ""))),
+    }
 
 
 def get_featured_movie(tmdb_df: pd.DataFrame) -> dict[str, str]:
@@ -1104,8 +1158,129 @@ def render_status_strip(sentiment_loaded: bool, reco_loaded: bool, tmdb_ready: b
     )
 
 
+def _apply_dark_theme(fig: go.Figure) -> go.Figure:
+    fig.update_layout(
+        paper_bgcolor="#0F0F0F",
+        plot_bgcolor="#0F0F0F",
+        font_color="#F5F5F1",
+        legend_title_text="",
+    )
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def build_tmdb_review_bridge(df: pd.DataFrame, tmdb_all: pd.DataFrame) -> pd.DataFrame:
+    if tmdb_all.empty or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "review",
+                "sentiment",
+                "sentiment_label",
+                "genre",
+                "title",
+                "vote_average",
+                "popularity",
+                "release_year",
+            ]
+        )
+
+    map_idx = np.arange(len(df)) % len(tmdb_all)
+    tmdb_map = tmdb_all.iloc[map_idx].reset_index(drop=True)
+
+    combined = df[["review", "sentiment", "sentiment_label"]].copy().reset_index(drop=True)
+    combined["genre"] = tmdb_map["primary_genre"].astype(str).replace("", "Unknown")
+    combined["title"] = tmdb_map["title"].astype(str)
+    combined["vote_average"] = pd.to_numeric(tmdb_map["vote_average"], errors="coerce").fillna(0.0)
+    combined["popularity"] = pd.to_numeric(tmdb_map["popularity"], errors="coerce").fillna(0.0)
+    combined["release_year"] = pd.to_numeric(tmdb_map.get("release_year", 0), errors="coerce").fillna(0).astype(int)
+    return combined
+
+
+def build_genre_sentiment_chart(bridge_df: pd.DataFrame) -> go.Figure:
+    grouped = (
+        bridge_df.groupby(["genre", "sentiment_label"], as_index=False)
+        .size()
+        .rename(columns={"size": "count"})
+    )
+    totals = grouped.groupby("genre")["count"].transform("sum")
+    grouped["percent"] = (grouped["count"] / totals) * 100
+
+    fig = px.bar(
+        grouped,
+        x="genre",
+        y="percent",
+        color="sentiment_label",
+        barmode="stack",
+        title="Genre-wise Sentiment Analysis (% Positive vs Negative)",
+        labels={"percent": "Percentage", "genre": "Genre", "sentiment_label": "Sentiment"},
+        color_discrete_map={"positive": "#20C997", "negative": "#E50914"},
+    )
+    fig.update_yaxes(range=[0, 100], ticksuffix="%")
+    fig.update_xaxes(tickangle=-30)
+    return _apply_dark_theme(fig)
+
+
+def build_tfidf_importance_chart(model_bundle, top_n: int = 12) -> go.Figure:
+    feature_names = model_bundle.vectorizer.get_feature_names_out()
+    coeffs = model_bundle.model.coef_[0]
+
+    top_pos_idx = np.argsort(coeffs)[-top_n:][::-1]
+    top_neg_idx = np.argsort(coeffs)[:top_n]
+
+    pos_df = pd.DataFrame(
+        {"word": feature_names[top_pos_idx], "weight": coeffs[top_pos_idx], "class": "Positive signal"}
+    )
+    neg_df = pd.DataFrame(
+        {"word": feature_names[top_neg_idx], "weight": np.abs(coeffs[top_neg_idx]), "class": "Negative signal"}
+    )
+    chart_df = pd.concat([pos_df, neg_df], ignore_index=True)
+
+    fig = px.bar(
+        chart_df,
+        x="weight",
+        y="word",
+        color="class",
+        orientation="h",
+        barmode="group",
+        title="Top TF-IDF Keywords Driving Sentiment",
+        color_discrete_map={"Positive signal": "#20C997", "Negative signal": "#E50914"},
+        labels={"weight": "Importance Weight", "word": "Keyword"},
+    )
+    fig.update_layout(yaxis={"categoryorder": "total ascending"})
+    return _apply_dark_theme(fig)
+
+
+def build_rating_vs_sentiment_chart(bridge_df: pd.DataFrame) -> go.Figure:
+    fig = px.box(
+        bridge_df,
+        x="sentiment_label",
+        y="vote_average",
+        color="sentiment_label",
+        title="TMDB Rating vs Review Sentiment",
+        labels={"sentiment_label": "Sentiment", "vote_average": "TMDB Vote Average"},
+        color_discrete_map={"positive": "#20C997", "negative": "#E50914"},
+    )
+    return _apply_dark_theme(fig)
+
+
+def build_trending_chart(bridge_df: pd.DataFrame) -> go.Figure:
+    top_trending = bridge_df.sort_values("popularity", ascending=False).drop_duplicates("title").head(10)
+    fig = px.bar(
+        top_trending,
+        x="title",
+        y="popularity",
+        color="sentiment_label",
+        title="Top 10 Trending Movies by Popularity",
+        labels={"title": "Movie", "popularity": "Popularity", "sentiment_label": "Sentiment"},
+        color_discrete_map={"positive": "#20C997", "negative": "#E50914"},
+    )
+    fig.update_xaxes(tickangle=-35)
+    return _apply_dark_theme(fig)
+
+
 def render_home(df: pd.DataFrame, model_bundle, tmdb_df: pd.DataFrame) -> None:
-    hero_background_url = "https://image.tmdb.org/t/p/original/56v2KjBlU4XaOv9rVYEQypROD7P.jpg"
+    featured = get_featured_movie(tmdb_df)
+    hero_background_url = featured["background_url"]
     trending_tiles: list[str] = []
     source_count = CARD_LIMIT if tmdb_df.empty else min(CARD_LIMIT, len(tmdb_df))
     for idx in range(source_count):
@@ -1145,18 +1320,16 @@ def render_home(df: pd.DataFrame, model_bundle, tmdb_df: pd.DataFrame) -> None:
             <div class="netflix-brand">NETFLIX</div>
             <div class="netflix-hero-content">
                 <div class="series-pill"><span class="n">N</span> SERIES</div>
-                <h1 class="home-main-title">STRANGER<br/>THINGS</h1>
-                <h2 class="top-ten"><span>TOP 10</span>  #1 in TV Shows Today</h2>
+                <h1 class="home-main-title">AI-POWERED MOVIE<br/>INTELLIGENCE DASHBOARD</h1>
+                <h2 class="top-ten"><span>PIPELINE</span>  Reviews → Sentiment → Insights → Recommendations</h2>
                 <p class="home-description">
-                    When a young boy vanishes, a small town uncovers a mystery involving secret experiments,
-                    terrifying supernatural forces and one strange little girl.
+                    Analyze reviews, discover insights, and get personalized movie recommendations.
                 </p>
                 <div class="hero-cta">
-                    <button class="hero-cta-btn">▶ Play</button>
-                    <button class="hero-cta-btn info">More info</button>
+                    <button class="hero-cta-btn">Explore Insights</button>
+                    <button class="hero-cta-btn info">View Recommendations</button>
                 </div>
             </div>
-            <div class="maturity-tag">TV-14</div>
             <div class="trending-section">
                 <h3 class="trending-title">Trending Now</h3>
                 <div class="trending-row">{tiles_html}</div>
@@ -1167,32 +1340,104 @@ def render_home(df: pd.DataFrame, model_bundle, tmdb_df: pd.DataFrame) -> None:
     st.markdown(home_html, unsafe_allow_html=True)
 
 
-def render_data_insights(df: pd.DataFrame) -> None:
+def render_data_insights(df: pd.DataFrame, tmdb_all: pd.DataFrame, model_bundle) -> None:
     st.markdown("<div class='pulse'></div>", unsafe_allow_html=True)
-    st.subheader("Data Insights")
+    st.subheader("Step 1: Explore Data")
+    st.caption("Apply filters to make every visualization reactive.")
+
+    bridge_df = build_tmdb_review_bridge(df, tmdb_all)
+    if bridge_df.empty:
+        st.info("TMDB linkage data is unavailable for advanced analytics.")
+        return
+
+    genres = sorted(g for g in bridge_df["genre"].dropna().unique().tolist() if g and g != "Unknown")
+    sentiment_opts = ["All", "positive", "negative"]
+    years = sorted(y for y in bridge_df.get("release_year", pd.Series(dtype=int)).unique().tolist() if int(y) > 0)
+
+    f1, f2, f3, f4 = st.columns(4)
+    selected_genre = f1.selectbox("Select Genre", ["All"] + genres, key="filter_genre")
+    selected_sentiment = f2.selectbox("Select Sentiment", sentiment_opts, key="filter_sentiment")
+    min_rating = float(max(0.0, bridge_df["vote_average"].min()))
+    max_rating = float(max(1.0, bridge_df["vote_average"].max()))
+    selected_rating = f3.slider(
+        "Rating Range",
+        min_value=round(min_rating, 1),
+        max_value=round(max_rating, 1),
+        value=(round(min_rating, 1), round(max_rating, 1)),
+        key="filter_rating",
+    )
+    selected_year = f4.selectbox("Year", ["All"] + years, key="filter_year")
+
+    filtered = bridge_df.copy()
+    if selected_genre != "All":
+        filtered = filtered[filtered["genre"] == selected_genre]
+    if selected_sentiment != "All":
+        filtered = filtered[filtered["sentiment_label"] == selected_sentiment]
+    if selected_year != "All":
+        filtered = filtered[filtered["release_year"] == int(selected_year)]
+    filtered = filtered[
+        (filtered["vote_average"] >= selected_rating[0]) & (filtered["vote_average"] <= selected_rating[1])
+    ]
+
+    if filtered.empty:
+        st.warning("No records match the selected filters.")
+        return
+
+    model_filtered = filtered[["review", "sentiment", "sentiment_label"]].copy()
 
     c1, c2 = st.columns(2)
-    c1.plotly_chart(build_sentiment_pie(df), use_container_width=True)
-    c2.plotly_chart(build_review_length_hist(df), use_container_width=True)
+    c1.plotly_chart(build_sentiment_pie(model_filtered), use_container_width=True)
+    c2.plotly_chart(build_review_length_hist(model_filtered.assign(review_length=model_filtered["review"].str.split().str.len())), use_container_width=True)
 
-    st.plotly_chart(build_word_cloud_figure(df), use_container_width=True)
+    st.plotly_chart(build_word_cloud_figure(model_filtered), use_container_width=True)
 
     wc_col1, wc_col2 = st.columns(2)
     wc_col1.plotly_chart(
-        build_word_cloud_figure(df, sentiment_label="positive"),
+        build_word_cloud_figure(model_filtered, sentiment_label="positive"),
         use_container_width=True,
     )
     wc_col2.plotly_chart(
-        build_word_cloud_figure(df, sentiment_label="negative"),
+        build_word_cloud_figure(model_filtered, sentiment_label="negative"),
         use_container_width=True,
     )
 
-    st.plotly_chart(build_top_words_bar(df, n_words=15), use_container_width=True)
+    st.plotly_chart(build_top_words_bar(model_filtered, n_words=15), use_container_width=True)
+
+    st.markdown("### Advanced Insights")
+    st.plotly_chart(build_genre_sentiment_chart(filtered), use_container_width=True)
+    st.plotly_chart(build_tfidf_importance_chart(model_bundle), use_container_width=True)
+
+    r1, r2 = st.columns(2)
+    r1.plotly_chart(build_rating_vs_sentiment_chart(filtered), use_container_width=True)
+    r2.plotly_chart(build_trending_chart(filtered), use_container_width=True)
+
+
+def explain_sentiment_prediction(text: str, model_bundle, top_n: int = 8) -> tuple[list[str], list[str]]:
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return [], []
+
+    vec = model_bundle.vectorizer.transform([clean_text])
+    if vec.nnz == 0:
+        return [], []
+
+    feature_names = model_bundle.vectorizer.get_feature_names_out()
+    coeffs = model_bundle.model.coef_[0]
+    indices = vec.indices
+    values = vec.data
+    contributions = coeffs[indices] * values
+
+    pos_idx = np.argsort(contributions)[::-1]
+    neg_idx = np.argsort(contributions)
+
+    positive_words = [feature_names[indices[i]] for i in pos_idx if contributions[i] > 0][:top_n]
+    negative_words = [feature_names[indices[i]] for i in neg_idx if contributions[i] < 0][:top_n]
+    return positive_words, negative_words
 
 
 def render_sentiment_analyzer(model_bundle) -> None:
-    st.subheader("Sentiment Analyzer")
-    st.write("Type a movie review and get predicted sentiment with confidence.")
+    st.subheader("Step 2: Analyze Review")
+    st.write("Type a movie review to predict sentiment and see model explanation.")
 
     text = st.text_area(
         "Enter review text",
@@ -1208,22 +1453,39 @@ def render_sentiment_analyzer(model_bundle) -> None:
             st.warning("Please enter a review before analyzing.")
         else:
             label_color = "#20C997" if pred["label"] == "Positive" else "#E50914"
+            conf_pct = int(round(pred["score"] * 100))
+            pos_pct = int(round(pred["proba_positive"] * 100))
+            neg_pct = int(round(pred["proba_negative"] * 100))
             st.markdown(
                 f"""
                 <div class="movie-card" style="border-left-color:{label_color};">
                     <h4>Prediction: {pred['label']}</h4>
-                    <div class="meta">Confidence: {pred['score'] * 100:.2f}%</div>
-                    <div>Positive Probability: {pred['proba_positive'] * 100:.2f}%</div>
-                    <div>Negative Probability: {pred['proba_negative'] * 100:.2f}%</div>
+                    <div class="meta">Confidence: {conf_pct}%</div>
+                    <div>{_confidence_bar(conf_pct)} {conf_pct}%</div>
+                    <div style="margin-top:8px;">Positive Probability: {_confidence_bar(pos_pct)} {pos_pct}%</div>
+                    <div>Negative Probability: {_confidence_bar(neg_pct)} {neg_pct}%</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
+            pos_words, neg_words = explain_sentiment_prediction(text, model_bundle)
+            c1, c2 = st.columns(2)
+            c1.markdown("**Positive Signal Words**")
+            c1.write(", ".join(pos_words) if pos_words else "No strong positive keywords found.")
+            c2.markdown("**Negative Signal Words**")
+            c2.write(", ".join(neg_words) if neg_words else "No strong negative keywords found.")
+
+            if pred["label"] == "Positive":
+                reason = "The model found stronger positive keyword contributions in this review."
+            else:
+                reason = "The model found stronger negative keyword contributions in this review."
+            st.info(f"Why this prediction: {reason}")
+
 
 def render_recommendations(reco_bundle, tmdb_df: pd.DataFrame) -> None:
-    st.subheader("Recommendations")
-    st.write("Enter a review or mood and get personalized recommendations.")
+    st.subheader("Step 3: Get Recommendations")
+    st.write("Enter a review or mood to generate personalized recommendation rows.")
 
     user_text = st.text_area(
         "Input review for recommendations",
@@ -1267,19 +1529,29 @@ def render_recommendations(reco_bundle, tmdb_df: pd.DataFrame) -> None:
 
         positive_cards: list[str] = []
         negative_cards: list[str] = []
+        detail_payloads: list[dict] = []
 
         for idx, item in enumerate(results[:CARD_LIMIT], start=1):
-            movie_title, movie_overview, poster_url, movie_genre = get_movie_data(300 + idx, tmdb_df)
+            movie_payload = get_movie_payload(300 + idx, tmdb_df)
             sentiment = item["sentiment"]
             card = _build_card_html(
-                movie_title=movie_title,
-                movie_overview=movie_overview,
-                movie_genre=movie_genre,
+                movie_title=movie_payload["title"],
+                movie_overview=_truncate_text(movie_payload["overview"], 100),
+                movie_genre=movie_payload["genre"],
                 review=item["review"],
                 sentiment=sentiment,
-                poster_url=poster_url,
+                poster_url=movie_payload["poster_url"],
                 meta=f"Similarity: {item['similarity']:.3f}",
                 match_score=float(item["similarity"]),
+            )
+            detail_payloads.append(
+                {
+                    "idx": idx,
+                    "sentiment": sentiment,
+                    "review": item["review"],
+                    "similarity": float(item["similarity"]),
+                    **movie_payload,
+                }
             )
             if sentiment.lower() == "positive":
                 positive_cards.append(card)
@@ -1289,9 +1561,23 @@ def render_recommendations(reco_bundle, tmdb_df: pd.DataFrame) -> None:
         render_card_row("Top Positive Reviews", positive_cards[:CARD_LIMIT])
         render_card_row("Top Negative Reviews", negative_cards[:CARD_LIMIT])
 
+        st.markdown("### Recommendation Details")
+        cols = st.columns(2)
+        for i, payload in enumerate(detail_payloads):
+            with cols[i % 2]:
+                label = f"#{payload['idx']} {payload['title']} ({int(round(payload['similarity'] * 100))}% match)"
+                with st.expander(label, expanded=False):
+                    st.image(payload["poster_url"], use_container_width=True)
+                    st.write(f"**Genre:** {payload['genre']}")
+                    st.write(f"**Sentiment:** {payload['sentiment']}")
+                    st.write(f"**Rating:** {payload['rating']} | **Popularity:** {payload['popularity']}")
+                    st.write(f"**Keywords:** {payload['keywords']}")
+                    st.write(f"**Overview:** {_truncate_text(payload['overview'], 260)}")
+                    st.write(f"**Matched Review:** {_truncate_text(payload['review'], 300)}")
+
 
 def render_model_metrics(model_bundle) -> None:
-    st.subheader("Model Metrics")
+    st.subheader("Step 4: Understand Model")
     st.metric("Sentiment Model Accuracy", f"{model_bundle.accuracy * 100:.2f}%")
 
     cm = model_bundle.confusion_matrix
@@ -1331,7 +1617,9 @@ def main() -> None:
 
     with st.spinner("Loading and preparing data..."):
         df = get_clean_data(str(csv_path))
-        tmdb_df, all_tmdb_posters_missing = get_tmdb_data(str(tmdb_path)) if tmdb_path else (pd.DataFrame(), False)
+        tmdb_all, tmdb_df, all_tmdb_posters_missing = (
+            get_tmdb_data(str(tmdb_path)) if tmdb_path else (pd.DataFrame(), pd.DataFrame(), False)
+        )
 
     with st.spinner("Preparing sentiment model..."):
         sentiment_bundle, sentiment_loaded = get_trained_sentiment_bundle(df, str(sentiment_artifact))
@@ -1342,25 +1630,28 @@ def main() -> None:
     st.markdown('<div class="top-nav-wrap">', unsafe_allow_html=True)
     section = st.radio(
         "Navigation",
-        ["🏠 Home", "🎞️ Recommendations", "📊 Data Insights", "🧠 Sentiment Analyzer", "📈 Model Metrics"],
+        [
+            "Step 1: Explore Data",
+            "Step 2: Analyze Review",
+            "Step 3: Get Recommendations",
+            "Step 4: Understand Model",
+        ],
         horizontal=True,
         label_visibility="collapsed",
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
     tmdb_ready = tmdb_path is not None and not all_tmdb_posters_missing
-    if section != "🏠 Home":
-        render_status_strip(sentiment_loaded, reco_loaded, tmdb_ready)
+    render_status_strip(sentiment_loaded, reco_loaded, tmdb_ready)
 
-    if section == "🏠 Home":
+    if section == "Step 1: Explore Data":
         render_home(df, sentiment_bundle, tmdb_df)
-    elif section == "📊 Data Insights":
-        render_data_insights(df)
-    elif section == "🧠 Sentiment Analyzer":
+        render_data_insights(df, tmdb_all, sentiment_bundle)
+    elif section == "Step 2: Analyze Review":
         render_sentiment_analyzer(sentiment_bundle)
-    elif section == "🎞️ Recommendations":
+    elif section == "Step 3: Get Recommendations":
         render_recommendations(reco_bundle, tmdb_df)
-    elif section == "📈 Model Metrics":
+    elif section == "Step 4: Understand Model":
         render_model_metrics(sentiment_bundle)
 
 
