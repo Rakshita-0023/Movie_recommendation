@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import html
+import os
 import random
 import textwrap
 from pathlib import Path
@@ -22,7 +23,8 @@ from src.eda import (
     build_word_cloud_figure,
 )
 from src.recommendation import build_or_load_recommender, recommend_similar_reviews
-from src.sentiment import predict_sentiment, train_or_load_sentiment_model
+from src.recommendation import load_recommender_bundle
+from src.sentiment import load_sentiment_bundle, predict_sentiment, train_or_load_sentiment_model
 
 
 st.set_page_config(
@@ -33,6 +35,10 @@ st.set_page_config(
 
 
 CARD_LIMIT = 12
+TMDB_MAX_ROWS = int(os.getenv("TMDB_MAX_ROWS", "5000"))
+IMDB_MAX_ROWS = int(os.getenv("IMDB_MAX_ROWS", "15000"))
+ALLOW_RUNTIME_TRAINING = os.getenv("ALLOW_RUNTIME_TRAINING", "0").strip().lower() in {"1", "true", "yes"}
+SAFE_MODE = os.getenv("SAFE_MODE", "1").strip().lower() in {"1", "true", "yes"}
 POSTER_URLS = [
     "https://image.tmdb.org/t/p/w500/8UlWHLMpgZm9bx6QYh0NFoq67TZ.jpg",
     "https://image.tmdb.org/t/p/w500/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg",
@@ -57,7 +63,7 @@ def _poster_url(seed: int) -> str:
 
 @st.cache_data(show_spinner=False)
 def get_tmdb_data(csv_path: str) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
-    tmdb = pd.read_csv(csv_path)
+    tmdb = pd.read_csv(csv_path, nrows=TMDB_MAX_ROWS if TMDB_MAX_ROWS > 0 else None)
     if "poster_path" not in tmdb.columns:
         tmdb["poster_path"] = ""
     if "backdrop_path" not in tmdb.columns:
@@ -1034,6 +1040,19 @@ def inject_custom_css() -> None:
 
 @st.cache_data(show_spinner=False)
 def get_clean_data(csv_path: str) -> pd.DataFrame:
+    if SAFE_MODE:
+        sample = pd.read_csv(csv_path, nrows=IMDB_MAX_ROWS if IMDB_MAX_ROWS > 0 else None)
+        sample.columns = [col.strip().lower().replace(" ", "_") for col in sample.columns]
+        if "review" not in sample.columns or "sentiment" not in sample.columns:
+            raise ValueError("Dataset must contain 'review' and 'sentiment' columns.")
+        sample = sample[["review", "sentiment"]].copy()
+        sample["review"] = sample["review"].astype(str).str.strip()
+        sample["sentiment_label"] = sample["sentiment"].astype(str).str.strip().str.lower()
+        sample = sample[sample["sentiment_label"].isin({"positive", "negative"})]
+        sample["sentiment"] = sample["sentiment_label"].map({"positive": 1, "negative": 0}).astype(int)
+        sample = sample.drop_duplicates(subset=["review", "sentiment_label"]).reset_index(drop=True)
+        sample["review_length"] = sample["review"].str.split().str.len()
+        return sample
     return load_and_clean_data(csv_path)
 
 
@@ -1045,6 +1064,16 @@ def get_trained_sentiment_bundle(df: pd.DataFrame, artifact_path: str):
 @st.cache_resource(show_spinner=False)
 def get_recommender_bundle(df: pd.DataFrame, artifact_path: str):
     return build_or_load_recommender(df, artifact_path)
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_sentiment_bundle(artifact_path: str):
+    return load_sentiment_bundle(artifact_path)
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_recommender_bundle(artifact_path: str):
+    return load_recommender_bundle(artifact_path)
 
 
 def render_hero_banner(tmdb_df: pd.DataFrame) -> None:
@@ -1142,8 +1171,8 @@ def render_stats_strip(df: pd.DataFrame, model_bundle) -> None:
 
 
 def render_status_strip(sentiment_loaded: bool, reco_loaded: bool, tmdb_ready: bool) -> None:
-    sentiment_label = "Sentiment model cached" if sentiment_loaded else "Sentiment model trained"
-    reco_label = "Recommender cached" if reco_loaded else "Recommender built"
+    sentiment_label = "Sentiment model cached" if sentiment_loaded else "Sentiment model not loaded"
+    reco_label = "Recommender cached" if reco_loaded else "Recommender not loaded"
     tmdb_label = "TMDB posters active" if tmdb_ready else "TMDB posters unavailable"
     tmdb_class = "ok" if tmdb_ready else "warn"
     st.markdown(
@@ -1156,6 +1185,41 @@ def render_status_strip(sentiment_loaded: bool, reco_loaded: bool, tmdb_ready: b
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_deployment_diagnostics(
+    csv_path: Path,
+    tmdb_path: Path | None,
+    sentiment_artifact: Path,
+    recommender_artifact: Path,
+) -> None:
+    with st.expander("Deployment Diagnostics", expanded=False):
+        st.caption("Quick runtime checks for cloud deployment stability.")
+        diagnostics = pd.DataFrame(
+            [
+                {"check": "IMDB dataset", "status": "OK" if csv_path.exists() else "MISSING", "path": str(csv_path)},
+                {"check": "TMDB dataset", "status": "OK" if (tmdb_path and tmdb_path.exists()) else "MISSING", "path": str(tmdb_path) if tmdb_path else "not configured"},
+                {
+                    "check": "Sentiment artifact",
+                    "status": "OK" if sentiment_artifact.exists() else "MISSING",
+                    "path": str(sentiment_artifact),
+                },
+                {
+                    "check": "Recommender artifact",
+                    "status": "OK" if recommender_artifact.exists() else "MISSING",
+                    "path": str(recommender_artifact),
+                },
+                {"check": "SAFE_MODE", "status": "ON" if SAFE_MODE else "OFF", "path": str(SAFE_MODE)},
+                {
+                    "check": "ALLOW_RUNTIME_TRAINING",
+                    "status": "ON" if ALLOW_RUNTIME_TRAINING else "OFF",
+                    "path": str(ALLOW_RUNTIME_TRAINING),
+                },
+                {"check": "IMDB_MAX_ROWS", "status": str(IMDB_MAX_ROWS), "path": str(IMDB_MAX_ROWS)},
+                {"check": "TMDB_MAX_ROWS", "status": str(TMDB_MAX_ROWS), "path": str(TMDB_MAX_ROWS)},
+            ]
+        )
+        st.dataframe(diagnostics, use_container_width=True, hide_index=True)
 
 
 def _apply_dark_theme(fig: go.Figure) -> go.Figure:
@@ -1340,7 +1404,7 @@ def render_home(df: pd.DataFrame, model_bundle, tmdb_df: pd.DataFrame) -> None:
     st.markdown(home_html, unsafe_allow_html=True)
 
 
-def render_data_insights(df: pd.DataFrame, tmdb_all: pd.DataFrame, model_bundle) -> None:
+def render_data_insights(df: pd.DataFrame, tmdb_all: pd.DataFrame, model_bundle=None) -> None:
     st.markdown("<div class='pulse'></div>", unsafe_allow_html=True)
     st.subheader("Step 1: Explore Data")
     st.caption("Apply filters to make every visualization reactive.")
@@ -1405,7 +1469,10 @@ def render_data_insights(df: pd.DataFrame, tmdb_all: pd.DataFrame, model_bundle)
 
     st.markdown("### Advanced Insights")
     st.plotly_chart(build_genre_sentiment_chart(filtered), use_container_width=True)
-    st.plotly_chart(build_tfidf_importance_chart(model_bundle), use_container_width=True)
+    if model_bundle is not None:
+        st.plotly_chart(build_tfidf_importance_chart(model_bundle), use_container_width=True)
+    else:
+        st.info("Load the sentiment model from Step 2 or Step 4 to view TF-IDF keyword importance.")
 
     r1, r2 = st.columns(2)
     r1.plotly_chart(build_rating_vs_sentiment_chart(filtered), use_container_width=True)
@@ -1483,7 +1550,7 @@ def render_sentiment_analyzer(model_bundle) -> None:
             st.info(f"Why this prediction: {reason}")
 
 
-def render_recommendations(reco_bundle, tmdb_df: pd.DataFrame) -> None:
+def render_recommendations(df: pd.DataFrame, recommender_artifact: str, tmdb_df: pd.DataFrame) -> None:
     st.subheader("Step 3: Get Recommendations")
     st.write("Enter a review or mood to generate personalized recommendation rows.")
 
@@ -1503,6 +1570,17 @@ def render_recommendations(reco_bundle, tmdb_df: pd.DataFrame) -> None:
     top_n = st.slider("Number of similar reviews", min_value=3, max_value=10, value=5)
 
     if st.button("Find Similar Reviews"):
+        reco_bundle = get_cached_recommender_bundle(recommender_artifact)
+        if reco_bundle is None and ALLOW_RUNTIME_TRAINING:
+            with st.spinner("Building recommendation index (first run)..."):
+                reco_bundle, _ = get_recommender_bundle(df, recommender_artifact)
+        elif reco_bundle is None:
+            st.warning(
+                "Recommendation artifact is missing in deployment. "
+                "Add the prebuilt recommender `.joblib` file or set `ALLOW_RUNTIME_TRAINING=1`."
+            )
+            return
+
         with st.spinner("Finding best matches for you..."):
             results = recommend_similar_reviews(user_text, reco_bundle, top_n=top_n) if user_text.strip() else []
 
@@ -1603,29 +1681,30 @@ def main() -> None:
     ]
     artifact_dir = project_root / "artifacts"
 
+    if SAFE_MODE:
+        st.info("Running in lightweight demo mode (SAFE_MODE=1).")
+
     if not csv_path.exists():
         st.error(f"Dataset not found at: {csv_path}")
-        st.stop()
+        return
 
     tmdb_path = next((p for p in tmdb_path_candidates if p.exists()), None)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     csv_stat = csv_path.stat()
-    data_signature = f"{csv_stat.st_size}_{int(csv_stat.st_mtime)}"
+    data_signature = f"{csv_stat.st_size}"
     sentiment_artifact = artifact_dir / f"sentiment_bundle_{data_signature}.joblib"
     recommender_artifact = artifact_dir / f"recommender_bundle_{data_signature}.joblib"
 
-    with st.spinner("Loading and preparing data..."):
-        df = get_clean_data(str(csv_path))
-        tmdb_all, tmdb_df, all_tmdb_posters_missing = (
-            get_tmdb_data(str(tmdb_path)) if tmdb_path else (pd.DataFrame(), pd.DataFrame(), False)
-        )
-
-    with st.spinner("Preparing sentiment model..."):
-        sentiment_bundle, sentiment_loaded = get_trained_sentiment_bundle(df, str(sentiment_artifact))
-
-    with st.spinner("Preparing recommendation index..."):
-        reco_bundle, reco_loaded = get_recommender_bundle(df, str(recommender_artifact))
+    try:
+        with st.spinner("Loading and preparing data..."):
+            df = get_clean_data(str(csv_path))
+            tmdb_all, tmdb_df, all_tmdb_posters_missing = (
+                get_tmdb_data(str(tmdb_path)) if tmdb_path else (pd.DataFrame(), pd.DataFrame(), False)
+            )
+    except Exception as exc:
+        st.error(f"Failed to load datasets safely: {exc}")
+        return
 
     st.markdown('<div class="top-nav-wrap">', unsafe_allow_html=True)
     section = st.radio(
@@ -1641,19 +1720,50 @@ def main() -> None:
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
+    sentiment_loaded = sentiment_artifact.exists()
+    reco_loaded = recommender_artifact.exists()
     tmdb_ready = tmdb_path is not None and not all_tmdb_posters_missing
     render_status_strip(sentiment_loaded, reco_loaded, tmdb_ready)
+    render_deployment_diagnostics(
+        csv_path=csv_path,
+        tmdb_path=tmdb_path,
+        sentiment_artifact=sentiment_artifact,
+        recommender_artifact=recommender_artifact,
+    )
 
     if section == "Step 1: Explore Data":
-        render_home(df, sentiment_bundle, tmdb_df)
-        render_data_insights(df, tmdb_all, sentiment_bundle)
+        render_home(df, None, tmdb_df)
+        render_data_insights(df, tmdb_all)
     elif section == "Step 2: Analyze Review":
-        render_sentiment_analyzer(sentiment_bundle)
+        sentiment_bundle = get_cached_sentiment_bundle(str(sentiment_artifact))
+        if sentiment_bundle is None and ALLOW_RUNTIME_TRAINING:
+            with st.spinner("Preparing sentiment model (first run)..."):
+                sentiment_bundle, _ = get_trained_sentiment_bundle(df, str(sentiment_artifact))
+        if sentiment_bundle is None:
+            st.warning(
+                "Sentiment model artifact is missing in deployment. "
+                "Add the prebuilt sentiment `.joblib` file or set `ALLOW_RUNTIME_TRAINING=1`."
+            )
+        else:
+            render_sentiment_analyzer(sentiment_bundle)
     elif section == "Step 3: Get Recommendations":
-        render_recommendations(reco_bundle, tmdb_df)
+        render_recommendations(df, str(recommender_artifact), tmdb_df)
     elif section == "Step 4: Understand Model":
-        render_model_metrics(sentiment_bundle)
+        sentiment_bundle = get_cached_sentiment_bundle(str(sentiment_artifact))
+        if sentiment_bundle is None and ALLOW_RUNTIME_TRAINING:
+            with st.spinner("Preparing sentiment model (first run)..."):
+                sentiment_bundle, _ = get_trained_sentiment_bundle(df, str(sentiment_artifact))
+        if sentiment_bundle is None:
+            st.warning(
+                "Sentiment model artifact is missing in deployment. "
+                "Add the prebuilt sentiment `.joblib` file or set `ALLOW_RUNTIME_TRAINING=1`."
+            )
+        else:
+            render_model_metrics(sentiment_bundle)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        st.error(f"Application runtime error: {exc}")
