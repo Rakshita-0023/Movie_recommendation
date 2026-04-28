@@ -35,8 +35,16 @@ st.set_page_config(
 
 
 CARD_LIMIT = 12
-TMDB_MAX_ROWS = int(os.getenv("TMDB_MAX_ROWS", "5000"))
-IMDB_MAX_ROWS = int(os.getenv("IMDB_MAX_ROWS", "15000"))
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+TMDB_MAX_ROWS = _env_int("TMDB_MAX_ROWS", 5000)
+IMDB_MAX_ROWS = _env_int("IMDB_MAX_ROWS", 15000)
 ALLOW_RUNTIME_TRAINING = os.getenv("ALLOW_RUNTIME_TRAINING", "0").strip().lower() in {"1", "true", "yes"}
 SAFE_MODE = os.getenv("SAFE_MODE", "1").strip().lower() in {"1", "true", "yes"}
 POSTER_URLS = [
@@ -1219,7 +1227,10 @@ def render_deployment_diagnostics(
                 {"check": "TMDB_MAX_ROWS", "status": str(TMDB_MAX_ROWS), "path": str(TMDB_MAX_ROWS)},
             ]
         )
-        st.dataframe(diagnostics, use_container_width=True, hide_index=True)
+        try:
+            st.dataframe(diagnostics, use_container_width=True, hide_index=True)
+        except TypeError:
+            st.dataframe(diagnostics, use_container_width=True)
 
 
 def _apply_dark_theme(fig: go.Figure) -> go.Figure:
@@ -1695,6 +1706,15 @@ def main() -> None:
     data_signature = f"{csv_stat.st_size}"
     sentiment_artifact = artifact_dir / f"sentiment_bundle_{data_signature}.joblib"
     recommender_artifact = artifact_dir / f"recommender_bundle_{data_signature}.joblib"
+    print(f"[startup] BASE_DIR={project_root}")
+    print(f"[startup] csv_path={csv_path} exists={csv_path.exists()}")
+    print(f"[startup] tmdb_path={tmdb_path} exists={bool(tmdb_path and tmdb_path.exists())}")
+    print(f"[startup] sentiment_artifact={sentiment_artifact} exists={sentiment_artifact.exists()}")
+    print(f"[startup] recommender_artifact={recommender_artifact} exists={recommender_artifact.exists()}")
+    print(
+        f"[startup] SAFE_MODE={SAFE_MODE} ALLOW_RUNTIME_TRAINING={ALLOW_RUNTIME_TRAINING} "
+        f"IMDB_MAX_ROWS={IMDB_MAX_ROWS} TMDB_MAX_ROWS={TMDB_MAX_ROWS}"
+    )
 
     try:
         with st.spinner("Loading and preparing data..."):
