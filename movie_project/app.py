@@ -7,6 +7,8 @@ import html
 import os
 import random
 import textwrap
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +49,8 @@ TMDB_MAX_ROWS = _env_int("TMDB_MAX_ROWS", 5000)
 IMDB_MAX_ROWS = _env_int("IMDB_MAX_ROWS", 15000)
 ALLOW_RUNTIME_TRAINING = os.getenv("ALLOW_RUNTIME_TRAINING", "0").strip().lower() in {"1", "true", "yes"}
 SAFE_MODE = os.getenv("SAFE_MODE", "1").strip().lower() in {"1", "true", "yes"}
+SENTIMENT_ARTIFACT_URL = os.getenv("SENTIMENT_ARTIFACT_URL", "").strip()
+RECOMMENDER_ARTIFACT_URL = os.getenv("RECOMMENDER_ARTIFACT_URL", "").strip()
 POSTER_URLS = [
     "https://image.tmdb.org/t/p/w500/8UlWHLMpgZm9bx6QYh0NFoq67TZ.jpg",
     "https://image.tmdb.org/t/p/w500/q6y0Go1tsGEsmtFryDOJo3dEmqu.jpg",
@@ -1225,6 +1229,16 @@ def render_deployment_diagnostics(
                 },
                 {"check": "IMDB_MAX_ROWS", "status": str(IMDB_MAX_ROWS), "path": str(IMDB_MAX_ROWS)},
                 {"check": "TMDB_MAX_ROWS", "status": str(TMDB_MAX_ROWS), "path": str(TMDB_MAX_ROWS)},
+                {
+                    "check": "SENTIMENT_ARTIFACT_URL",
+                    "status": "SET" if bool(SENTIMENT_ARTIFACT_URL) else "UNSET",
+                    "path": "configured" if bool(SENTIMENT_ARTIFACT_URL) else "not configured",
+                },
+                {
+                    "check": "RECOMMENDER_ARTIFACT_URL",
+                    "status": "SET" if bool(RECOMMENDER_ARTIFACT_URL) else "UNSET",
+                    "path": "configured" if bool(RECOMMENDER_ARTIFACT_URL) else "not configured",
+                },
             ]
         )
         try:
@@ -1293,6 +1307,26 @@ def build_genre_sentiment_chart(bridge_df: pd.DataFrame) -> go.Figure:
     fig.update_yaxes(range=[0, 100], ticksuffix="%")
     fig.update_xaxes(tickangle=-30)
     return _apply_dark_theme(fig)
+
+
+def ensure_artifact_from_url(artifact_path: Path, url: str) -> tuple[bool, str]:
+    if artifact_path.exists():
+        return True, "artifact already present"
+    if not url:
+        return False, "no URL configured"
+
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            content = response.read()
+        if not content:
+            return False, "empty response"
+        artifact_path.write_bytes(content)
+        return True, "downloaded from URL"
+    except urllib.error.URLError as exc:
+        return False, f"url error: {exc}"
+    except Exception as exc:
+        return False, f"download failed: {exc}"
 
 
 def build_tfidf_importance_chart(model_bundle, top_n: int = 12) -> go.Figure:
@@ -1706,11 +1740,15 @@ def main() -> None:
     data_signature = f"{csv_stat.st_size}"
     sentiment_artifact = artifact_dir / f"sentiment_bundle_{data_signature}.joblib"
     recommender_artifact = artifact_dir / f"recommender_bundle_{data_signature}.joblib"
+    sent_ok, sent_msg = ensure_artifact_from_url(sentiment_artifact, SENTIMENT_ARTIFACT_URL)
+    reco_ok, reco_msg = ensure_artifact_from_url(recommender_artifact, RECOMMENDER_ARTIFACT_URL)
     print(f"[startup] BASE_DIR={project_root}")
     print(f"[startup] csv_path={csv_path} exists={csv_path.exists()}")
     print(f"[startup] tmdb_path={tmdb_path} exists={bool(tmdb_path and tmdb_path.exists())}")
     print(f"[startup] sentiment_artifact={sentiment_artifact} exists={sentiment_artifact.exists()}")
     print(f"[startup] recommender_artifact={recommender_artifact} exists={recommender_artifact.exists()}")
+    print(f"[startup] sentiment_artifact_fetch={sent_ok} detail={sent_msg}")
+    print(f"[startup] recommender_artifact_fetch={reco_ok} detail={reco_msg}")
     print(
         f"[startup] SAFE_MODE={SAFE_MODE} ALLOW_RUNTIME_TRAINING={ALLOW_RUNTIME_TRAINING} "
         f"IMDB_MAX_ROWS={IMDB_MAX_ROWS} TMDB_MAX_ROWS={TMDB_MAX_ROWS}"
